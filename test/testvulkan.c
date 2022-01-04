@@ -14,6 +14,15 @@
 #include <string.h>
 #include <math.h>
 
+#if defined(__linux__)
+#include <pthread.h>
+#include <dlfcn.h>
+#endif
+
+#include "flutter_embedder.h"
+#include "constants.h"
+#include "priority_queue.h"
+
 #include "SDL_test_common.h"
 
 #if defined(__ANDROID__) && defined(__ARM_EABI__) && !defined(__ARM_ARCH_7A__)
@@ -173,6 +182,17 @@ typedef struct VulkanContext
     VkImage *swapchainImages;
     VkCommandBuffer *commandBuffers;
     VkFence *fences;
+
+    FlutterEngineProcTable engine_proc_table;
+    FlutterEngine engine;
+    FlutterProjectArgs project_args;
+    FlutterRendererConfig renderer_config;
+    FlutterTaskRunnerDescription platform_task_runner;
+    FlutterCustomTaskRunners     custom_task_runners;
+    bool running;
+    pthread_t event_loop_thread;
+    priority_queue *pending_tasks;
+    uint32_t frameIndex;
 } VulkanContext;
 
 static SDLTest_CommonState *state;
@@ -810,6 +830,7 @@ static void destroyFences(void)
     vulkanContext->fences = NULL;
 }
 
+#if 0
 static void recordPipelineImageBarrier(VkCommandBuffer commandBuffer,
                                        VkAccessFlags sourceAccessMask,
                                        VkAccessFlags destAccessMask,
@@ -842,7 +863,9 @@ static void recordPipelineImageBarrier(VkCommandBuffer commandBuffer,
                          1,
                          &barrier);
 }
+#endif
 
+#if 0
 static void rerecordCommandBuffer(uint32_t frameIndex, const VkClearColorValue *clearColor)
 {
     VkCommandBuffer commandBuffer = vulkanContext->commandBuffers[frameIndex];
@@ -892,6 +915,7 @@ static void rerecordCommandBuffer(uint32_t frameIndex, const VkClearColorValue *
         quit(2);
     }
 }
+#endif
 
 static void destroySwapchainAndSwapchainSpecificStuff(SDL_bool doDestroySwapchain)
 {
@@ -915,6 +939,290 @@ static SDL_bool createNewSwapchainAndSwapchainSpecificStuff(void)
     createCommandPool();
     createCommandBuffers();
     createFences();
+    return SDL_TRUE;
+}
+
+static void log_message_callback(const char *tag, const char *message, void *user_data) {
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "[%s] %s\n", tag, message);
+}
+
+static const FlutterLocale* compute_platform_resolved_locale_callback(const FlutterLocale **supported_locales, size_t number_of_locales) {
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "locales_count: %zu\n", number_of_locales);
+    for (int i = 0; i < number_of_locales; i++)
+    {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "language_code: %s\n", supported_locales[i]->language_code);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "country_code: %s\n", supported_locales[i]->country_code);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "script_code: %s\n", supported_locales[i]->script_code);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "variant_code: %s\n", supported_locales[i]->variant_code);
+    }
+    return supported_locales[0];
+}
+
+static void platform_message_callback(const FlutterPlatformMessage *message, void *user_data) {
+
+	VulkanContext *ctx = (VulkanContext*)user_data;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "PlatformMessage: [%s] (%zu) %s", message->channel, message->message_size, message->message);
+    ctx->engine_proc_table.SendPlatformMessageResponse(ctx->engine, message->response_handle, NULL, 0);
+}
+
+static void on_pre_engine_restart_callback(void *user_data) {
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Pre-Engine Restart");
+}
+
+static void root_isolate_create_callback(void *user_data) {
+	SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "root isolate created");
+}
+
+static bool runs_task_on_current_thread_callback(void *user_data) {
+    bool res = pthread_equal(pthread_self(), ((VulkanContext *)user_data)->event_loop_thread) != 0;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "runs_task_on_current_thread = %d\n", res);
+    return res;
+}
+
+typedef struct _PostTask {
+    uint64_t target_time;
+    FlutterTask task;
+} PendingTask;
+
+static void post_task_callback(FlutterTask task, uint64_t target_time, void *user_data) {
+    VulkanContext *ctx = (VulkanContext*)user_data;
+
+    // professor leaky in the library with the pipe
+    PendingTask *t = (PendingTask *) malloc(sizeof(PendingTask));
+    t->target_time = target_time;
+    t->task.runner = task.runner;
+    t->task.task = task.task;
+    priority_queue_insert(ctx->pending_tasks, t);
+
+	SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "post task %d (%p)\n", priority_queue_size(ctx->pending_tasks), &t->task);
+}
+
+static void* get_instance_proc_address_callback(void *user_data, FlutterVulkanInstanceHandle instance, const char *name)
+{
+    return vkGetInstanceProcAddr(instance, name);
+}
+
+static FlutterVulkanImage get_next_image_callback(void *user_data, const FlutterFrameInfo *frame_info) {
+
+    VkResult result;
+
+    VulkanContext *ctx = (VulkanContext *)user_data;
+
+acquire:
+    result = vkAcquireNextImageKHR(vulkanContext->device,
+                                            vulkanContext->swapchain,
+                                            UINT64_MAX,
+                                            vulkanContext->imageAvailableSemaphore,
+                                            VK_NULL_HANDLE,
+                                            &ctx->frameIndex);
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        createNewSwapchainAndSwapchainSpecificStuff();
+        goto acquire;
+    }
+
+    if ((result != VK_SUBOPTIMAL_KHR) && (result != VK_SUCCESS)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "vkAcquireNextImageKHR(): %s\n",
+                     getVulkanResultString(result));
+        quit(2);
+    }
+
+    result = vkWaitForFences(vulkanContext->device, 1, &vulkanContext->fences[ctx->frameIndex], VK_FALSE, UINT64_MAX);
+    if (result != VK_SUCCESS) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "vkWaitForFences(): %s\n", getVulkanResultString(result));
+        quit(2);
+    }
+    result = vkResetFences(vulkanContext->device, 1, &vulkanContext->fences[ctx->frameIndex]);
+    if (result != VK_SUCCESS) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "vkResetFences(): %s\n", getVulkanResultString(result));
+        quit(2);
+    }
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "next_image (%p, %d,%d)\n", ctx->swapchainImages[ctx->frameIndex], frame_info->size.width, frame_info->size.height);
+
+    FlutterVulkanImage res = {
+        .struct_size = sizeof(FlutterVulkanImage),
+        .image = (FlutterVulkanImageHandle)ctx->swapchainImages[ctx->frameIndex],
+    };
+    return res;
+}
+
+static bool present_image_callback(void *user_data, const FlutterVulkanImage *image) {
+
+    VkResult result;
+    int w, h;
+    VkPresentInfoKHR presentInfo = {0};
+    VulkanContext *ctx = (VulkanContext *)user_data;
+
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "present_image (%p)\n", image->image);
+
+    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    presentInfo.waitSemaphoreCount = 1;
+    presentInfo.pWaitSemaphores = &vulkanContext->renderingFinishedSemaphore;
+    presentInfo.swapchainCount = 1;
+    presentInfo.pSwapchains = &vulkanContext->swapchain;
+    presentInfo.pImageIndices = &ctx->frameIndex;
+    result = vkQueuePresentKHR(vulkanContext->presentQueue, &presentInfo);
+    if ((result == VK_ERROR_OUT_OF_DATE_KHR) || (result == VK_SUBOPTIMAL_KHR)) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "VK_ERROR_OUT_OF_DATE_KHR || VK_SUBOPTIMAL_KHR");
+        createNewSwapchainAndSwapchainSpecificStuff();
+        return true;
+    }
+
+    if (result != VK_SUCCESS) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "vkQueuePresentKHR(): %s\n",
+                     getVulkanResultString(result));
+        quit(2);
+    }
+    SDL_Vulkan_GetDrawableSize(vulkanContext->window, &w, &h);
+    if(w != (int)vulkanContext->swapchainSize.width || h != (int)vulkanContext->swapchainSize.height) {
+        createNewSwapchainAndSwapchainSpecificStuff();
+    }
+
+    return true;
+}
+
+static int pending_tasks_comparator(const void *item_1, const void *item_2) {
+
+    PendingTask *value_1, *value_2;
+
+    value_1 = (PendingTask *) item_1;
+    value_2 = (PendingTask *) item_2;
+
+    if (value_1->target_time < value_2->target_time)
+    {
+        return SMALLER;
+    }
+    else if (value_1->target_time == value_2->target_time)
+    {
+        return EQUAL;
+    }
+    else
+    {
+        return GREATER;
+    }
+}
+
+static FlutterEngineResult run_task(VulkanContext *ctx) {
+
+	if (!ctx->engine)
+	{
+		return kSuccess;
+	}
+
+    if (!priority_queue_is_empty(ctx->pending_tasks))
+	{
+		uint64_t current = ctx->engine_proc_table.GetCurrentTime();
+        PendingTask *t = priority_queue_poll(ctx->pending_tasks);
+        //SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "%lu, %lu, (%p)", current, t->target_time, &t->task);
+		if (current >= t->target_time)
+		{
+            FlutterEngineResult res = ctx->engine_proc_table.RunTask(ctx->engine, &t->task);
+            if (res != kSuccess) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Failed running Task (%p)\n", &t->task);
+            }
+            free(t);
+		}
+	}
+	return kSuccess;
+}
+
+static SDL_bool initializeFlutterEngine(VulkanContext *ctx)
+{
+    void *handle;
+    char *error;
+
+    handle = dlopen("libflutter_engine.so", RTLD_LAZY);
+    if (!handle) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "%s\n", dlerror());
+        return SDL_FALSE;
+    }
+
+    dlerror();
+    
+    FlutterEngineResult (*GetProcAddresses)(FlutterEngineProcTable *);
+    GetProcAddresses = (FlutterEngineResult (*)(FlutterEngineProcTable *)) dlsym(handle, "FlutterEngineGetProcAddresses");
+
+    error = dlerror();
+    if (error != NULL) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "%s\n", error);
+        return SDL_FALSE;
+    }
+
+    ctx->event_loop_thread = pthread_self();
+
+	ctx->engine_proc_table.struct_size = sizeof(FlutterEngineProcTable);
+	if (kSuccess != GetProcAddresses(&ctx->engine_proc_table))
+	{
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "FlutterEngineGetProcAddresses != kSuccess\n");
+	}
+
+	ctx->project_args.struct_size   = sizeof(FlutterProjectArgs);
+	ctx->project_args.assets_path   = "/home/joel/development/gallery/build/flutter_assets";
+	ctx->project_args.icu_data_path = "/usr/local/share/flutter/icudtl.dat";
+	if (!ctx->engine_proc_table.RunsAOTCompiledDartCode())
+	{
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Runtime == Debug\n");
+	}
+
+	ctx->project_args.persistent_cache_path         = "/home/joel/.vkflutter";
+	ctx->project_args.is_persistent_cache_read_only = false;
+	ctx->project_args.shutdown_dart_vm_when_done    = true;
+//	ctx->project_args.command_line_argc             = static_cast<int>(ctx->command_line_args_c_.size());
+//	ctx->project_args.command_line_argv             = ctx->command_line_args_c_.data();
+	ctx->project_args.log_message_callback = log_message_callback;
+	ctx->project_args.compute_platform_resolved_locale_callback = compute_platform_resolved_locale_callback;
+	ctx->project_args.platform_message_callback = platform_message_callback;
+	ctx->project_args.on_pre_engine_restart_callback = on_pre_engine_restart_callback;
+	ctx->project_args.root_isolate_create_callback = root_isolate_create_callback;
+
+	ctx->platform_task_runner.struct_size                          = sizeof(FlutterTaskRunnerDescription);
+	ctx->platform_task_runner.user_data                            = ctx;
+	ctx->platform_task_runner.identifier                           = 1UL;
+	ctx->platform_task_runner.runs_task_on_current_thread_callback = runs_task_on_current_thread_callback;
+	ctx->platform_task_runner.post_task_callback = post_task_callback;
+
+	ctx->custom_task_runners.struct_size          = sizeof(FlutterCustomTaskRunners);
+	ctx->custom_task_runners.platform_task_runner = &ctx->platform_task_runner,
+	ctx->project_args.custom_task_runners         = &ctx->custom_task_runners;
+
+	ctx->renderer_config.type                      = kVulkan;
+	ctx->renderer_config.vulkan.struct_size        = sizeof(FlutterVulkanRendererConfig);    
+	ctx->renderer_config.vulkan.instance           = ctx->instance;
+	ctx->renderer_config.vulkan.physical_device    = ctx->physicalDevice;
+	ctx->renderer_config.vulkan.device             = ctx->device;
+	ctx->renderer_config.vulkan.queue_family_index = ctx->graphicsQueueFamilyIndex;
+	ctx->renderer_config.vulkan.queue              = ctx->graphicsQueue;
+
+	ctx->renderer_config.vulkan.get_instance_proc_address_callback = get_instance_proc_address_callback;
+	ctx->renderer_config.vulkan.get_next_image_callback = get_next_image_callback;
+	ctx->renderer_config.vulkan.present_image_callback = present_image_callback;
+
+    if (kSuccess != ctx->engine_proc_table.Initialize(FLUTTER_ENGINE_VERSION,
+	                                               &ctx->renderer_config,
+	                                               &ctx->project_args,
+	                                               ctx,
+	                                               &ctx->engine)) {
+        return SDL_FALSE;
+	}
+
+    ctx->pending_tasks = create_priority_queue( 48, &pending_tasks_comparator );
+
+    return SDL_TRUE;
+}
+
+static SDL_bool runFlutterEngine(VulkanContext *ctx)
+{
+	if (kSuccess != ctx->engine_proc_table.RunInitialized(ctx->engine))
+	{
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Run != kSuccess");
+	}
+
+	ctx->running = true;
+
+//	configure_locales();
     return SDL_TRUE;
 }
 
@@ -943,7 +1251,9 @@ static void initVulkan(void)
         getQueues();
         createSemaphores();
         createNewSwapchainAndSwapchainSpecificStuff();
-    }
+        initializeFlutterEngine(&vulkanContext[i]);
+        runFlutterEngine(&vulkanContext[i]);
+    }    
 }
 
 static void shutdownVulkan(SDL_bool doDestroySwapchain)
@@ -989,21 +1299,38 @@ static void shutdownVulkan(SDL_bool doDestroySwapchain)
 
 static SDL_bool render(void)
 {
-    uint32_t frameIndex;
-    VkResult result;
-    double currentTime;
-    VkClearColorValue clearColor = { {0} };
-    VkPipelineStageFlags waitDestStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    VkSubmitInfo submitInfo = {0};
-    VkPresentInfoKHR presentInfo = {0};
+//    uint32_t frameIndex;
+//    VkResult result;
+//    double currentTime;
+//    VkClearColorValue clearColor = { {0} };
+//    VkPipelineStageFlags waitDestStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+//    VkSubmitInfo submitInfo = {0};
+//    VkPresentInfoKHR presentInfo = {0};
     int w, h;
 
     if (!vulkanContext->swapchain) {
         SDL_bool retval = createNewSwapchainAndSwapchainSpecificStuff();
         if(!retval)
             SDL_Delay(100);
+
+        // Update Flutter Engine
+        SDL_Vulkan_GetDrawableSize(vulkanContext->window, &w, &h);
+
+        FlutterWindowMetricsEvent fwme = {
+            .struct_size = sizeof(FlutterWindowMetricsEvent),
+            .width = w,
+            .height = h, 
+            .pixel_ratio = 1.0
+        };
+
+        if (kSuccess != vulkanContext->engine_proc_table.SendWindowMetricsEvent(vulkanContext->engine, &fwme))
+        {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Failed send initial window size to flutter");
+        }
+
         return retval;
     }
+#if 0
     result = vkAcquireNextImageKHR(vulkanContext->device,
                                             vulkanContext->swapchain,
                                             UINT64_MAX,
@@ -1030,6 +1357,7 @@ static SDL_bool render(void)
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "vkResetFences(): %s\n", getVulkanResultString(result));
         quit(2);
     }
+
     currentTime = (double)SDL_GetPerformanceCounter() / SDL_GetPerformanceFrequency();
     clearColor.float32[0] = (float)(0.5 + 0.5 * SDL_sin(currentTime));
     clearColor.float32[1] = (float)(0.5 + 0.5 * SDL_sin(currentTime + M_PI * 2 / 3));
@@ -1071,6 +1399,7 @@ static SDL_bool render(void)
     if(w != (int)vulkanContext->swapchainSize.width || h != (int)vulkanContext->swapchainSize.height) {
         return createNewSwapchainAndSwapchainSpecificStuff();
     }
+#endif
     return SDL_TRUE;
 }
 
@@ -1132,12 +1461,21 @@ int main(int argc, char **argv)
             for (i = 0; i < state->num_windows; ++i) {
                 if (state->windows[i]) {
                     vulkanContext = &vulkanContexts[i];
+                    run_task(vulkanContext);
                     render();
                 }
             }
         }
     }
-
+    int i;
+    for (i = 0; i < state->num_windows; ++i) {
+        if (state->windows[i]) {
+            vulkanContext = &vulkanContexts[i];
+            vulkanContext->running = false;
+        }
+    }
+    SDL_Delay(300);
+    
     /* Print out some timing information */
     now = SDL_GetTicks();
     if (now > then) {

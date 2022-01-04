@@ -103,7 +103,7 @@ add_executable(testqsort testqsort.c)
 add_executable(testbounds testbounds.c)
 add_executable(testcustomcursor testcustomcursor.c)
 add_executable(controllermap controllermap.c)
-add_executable(testvulkan testvulkan.c)
+add_executable(testvulkan testvulkan.c priority_queue.c)
 add_executable(testoffscreen testoffscreen.c)
 
 if(OPENGL_FOUND)
